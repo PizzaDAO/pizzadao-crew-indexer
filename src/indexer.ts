@@ -1,3 +1,4 @@
+// src/indexer.ts
 import { createClient } from "@supabase/supabase-js";
 import pLimit from "p-limit";
 import { getGoogleClients, extractLinkedSpreadsheetIdsFromGrid } from "./google.js";
@@ -8,7 +9,6 @@ import { embed } from "./embed.js";
  * Simple structured logger (Railway-friendly)
  */
 function log(event: string, data: Record<string, any> = {}) {
-  // Keep it one-line JSON for easier scanning/filtering in Railway
   console.log(
     JSON.stringify({
       ts: new Date().toISOString(),
@@ -22,17 +22,22 @@ const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const ROOT_SPREADSHEET_ID = process.env.ROOT_SPREADSHEET_ID!;
 
+// ✅ NEW: seed discovery from the crew website
+const ROOT_URL = process.env.ROOT_URL || "https://crew.pizzadao.xyz";
+const WEBCRAWL_MAX_PAGES = Number(process.env.WEBCRAWL_MAX_PAGES || 500);
+
 const CONCURRENCY = Number(process.env.CRAWL_CONCURRENCY || 3);
 const SLEEP_MS = Number(process.env.SLEEP_MS || 500);
 const GOOGLE_TIMEOUT_MS = Number(process.env.GOOGLE_TIMEOUT_MS || 30_000);
 
-// BOOT BANNER (proves the container is running *your* code)
 log("boot", {
   node: process.version,
   concurrency: CONCURRENCY,
   sleepMs: SLEEP_MS,
   googleTimeoutMs: GOOGLE_TIMEOUT_MS,
   rootSpreadsheetId: ROOT_SPREADSHEET_ID,
+  rootUrl: ROOT_URL,
+  webcrawlMaxPages: WEBCRAWL_MAX_PAGES,
   impersonate: process.env.GOOGLE_IMPERSONATE_USER ?? null
 });
 
@@ -43,20 +48,113 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// Google Sheets ID extraction
+const SHEETS_ID_RE =
+  /https?:\/\/docs\.google\.com\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/g;
+
+function extractSheetIdsFromText(text: string): string[] {
+  const ids = new Set<string>();
+  let m: RegExpExecArray | null;
+  while ((m = SHEETS_ID_RE.exec(text)) !== null) ids.add(m[1]);
+  return [...ids];
+}
+
+// Extremely simple href extraction (good enough for typical Next/static sites)
+function extractLinksFromHtml(html: string, baseUrl: string): string[] {
+  const urls = new Set<string>();
+  const re = /href=["']([^"']+)["']/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    try {
+      const u = new URL(m[1], baseUrl);
+      urls.add(u.toString());
+    } catch {
+      // ignore invalid
+    }
+  }
+  return [...urls];
+}
+
+async function crawlRootSiteForSheetIds(opts: {
+  rootUrl: string;
+  maxPages: number;
+  sameOriginOnly?: boolean;
+}): Promise<{ sheetIds: string[]; pagesCrawled: number }> {
+  const rootUrl = opts.rootUrl.replace(/\/$/, "");
+  const maxPages = opts.maxPages;
+  const sameOriginOnly = opts.sameOriginOnly ?? true;
+
+  const origin = new URL(rootUrl).origin;
+
+  const queue: string[] = [rootUrl];
+  const seen = new Set<string>();
+  const sheetIds = new Set<string>();
+
+  while (queue.length && seen.size < maxPages) {
+    const url = queue.shift()!;
+    if (seen.has(url)) continue;
+    seen.add(url);
+
+    let html = "";
+    try {
+      const res = await fetch(url, { redirect: "follow" });
+      if (!res.ok) {
+        log("webcrawl.fetch.skip", { url, status: res.status });
+        continue;
+      }
+
+      const ct = res.headers.get("content-type") || "";
+      if (!ct.includes("text/html")) {
+        log("webcrawl.fetch.not_html", { url, contentType: ct });
+        continue;
+      }
+
+      html = await res.text();
+    } catch (e: any) {
+      log("webcrawl.fetch.error", { url, message: String(e?.message || e) });
+      continue;
+    }
+
+    // Extract sheet IDs from anywhere in HTML
+    for (const id of extractSheetIdsFromText(html)) sheetIds.add(id);
+
+    // Enqueue more same-origin links
+    const links = extractLinksFromHtml(html, url);
+    for (const link of links) {
+      try {
+        const u = new URL(link);
+        if (sameOriginOnly && u.origin !== origin) continue;
+        if (/\.(png|jpg|jpeg|gif|svg|css|js|ico|pdf|zip)$/i.test(u.pathname)) continue;
+        // drop hash to reduce duplicates
+        u.hash = "";
+        queue.push(u.toString());
+      } catch {
+        // ignore
+      }
+    }
+
+    if (seen.size % 25 === 0) {
+      log("webcrawl.progress", {
+        pagesCrawled: seen.size,
+        queued: queue.length,
+        discoveredSheets: sheetIds.size
+      });
+    }
+  }
+
+  return { sheetIds: [...sheetIds], pagesCrawled: seen.size };
+}
+
 async function upsertSpreadsheet(id: string) {
   const url = `https://docs.google.com/spreadsheets/d/${id}/edit`;
 
   // Only insert if new; never overwrite crawl_status for existing rows.
   const { error } = await supabase
     .from("spreadsheets")
-    .upsert(
-      { spreadsheet_id: id, url },
-      { onConflict: "spreadsheet_id", ignoreDuplicates: true }
-    );
+    .upsert({ spreadsheet_id: id, url }, { onConflict: "spreadsheet_id", ignoreDuplicates: true });
 
   if (error) throw error;
 }
-
 
 async function getNextPending() {
   const { data, error } = await supabase
@@ -76,7 +174,6 @@ async function getNextPending() {
 
   return id;
 }
-
 
 async function mark(id: string, patch: any) {
   const { error } = await supabase
@@ -154,7 +251,6 @@ async function ingestOne(spreadsheetId: string) {
           discoveredLinks++;
           await upsertSpreadsheet(id);
 
-          // best-effort link record (can add unique constraint later)
           const { error: linkErr } = await supabase.from("links").insert({
             from_spreadsheet_id: spreadsheetId,
             from_sheet_name: sheetName,
@@ -162,7 +258,6 @@ async function ingestOne(spreadsheetId: string) {
             to_spreadsheet_id: id
           });
           if (linkErr) {
-            // Don't fail the whole ingest on duplicate inserts etc.
             log("links.insert.warn", {
               spreadsheetId,
               toSpreadsheetId: id,
@@ -174,7 +269,6 @@ async function ingestOne(spreadsheetId: string) {
 
       if (unchanged) continue;
 
-      // Build values matrix from grid data
       const grid = sh.data?.[0];
       const rowData = grid?.rowData || [];
 
@@ -188,12 +282,7 @@ async function ingestOne(spreadsheetId: string) {
       const chunks = chunkRowsAsText({ sheetName, gid, values, maxRowsPerChunk: 25 });
       log("tab.chunks", { spreadsheetId, sheetName, chunkCount: chunks.length });
 
-      // Remove old chunks for this tab (simple approach)
-      await supabase
-        .from("chunks")
-        .delete()
-        .eq("spreadsheet_id", spreadsheetId)
-        .eq("sheet_name", sheetName);
+      await supabase.from("chunks").delete().eq("spreadsheet_id", spreadsheetId).eq("sheet_name", sheetName);
 
       for (const ch of chunks) {
         const embedding = await embed(ch.text);
@@ -208,10 +297,7 @@ async function ingestOne(spreadsheetId: string) {
         if (error) throw error;
 
         insertedChunks++;
-        // Avoid log spam: log every 10 chunks
-        if (insertedChunks % 10 === 0) {
-          log("chunks.insert.progress", { spreadsheetId, insertedChunks });
-        }
+        if (insertedChunks % 10 === 0) log("chunks.insert.progress", { spreadsheetId, insertedChunks });
 
         await sleep(SLEEP_MS);
       }
@@ -236,7 +322,6 @@ async function ingestOne(spreadsheetId: string) {
     const msg = String(e?.message || e);
     log("ingest.error", { spreadsheetId, message: msg });
 
-    // Ensure we never leave it stuck in pending with no error
     try {
       await mark(spreadsheetId, { crawl_status: "error", error: msg });
     } catch (markErr: any) {
@@ -248,7 +333,28 @@ async function ingestOne(spreadsheetId: string) {
 async function main() {
   log("main.start");
 
-  // Ensure root exists (in case seed wasn't run)
+  // ✅ NEW: seed from the crew website first (this is how we discover 100s of sheets)
+  if (ROOT_URL) {
+    log("seed.webcrawl.start", { rootUrl: ROOT_URL, maxPages: WEBCRAWL_MAX_PAGES });
+    const { sheetIds, pagesCrawled } = await crawlRootSiteForSheetIds({
+      rootUrl: ROOT_URL,
+      maxPages: WEBCRAWL_MAX_PAGES
+    });
+
+    log("seed.webcrawl.done", {
+      pagesCrawled,
+      discoveredSheets: sheetIds.length
+    });
+
+    for (const id of sheetIds) {
+      await upsertSpreadsheet(id);
+    }
+    log("seed.webcrawl.upserted", { count: sheetIds.length });
+  } else {
+    log("seed.webcrawl.skipped", { reason: "ROOT_URL not set" });
+  }
+
+  // Keep spreadsheet root too (can discover deeper links inside sheets)
   await upsertSpreadsheet(ROOT_SPREADSHEET_ID);
   log("root.upserted", { root: ROOT_SPREADSHEET_ID });
 
