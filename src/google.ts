@@ -6,13 +6,22 @@ export function getGoogleClients() {
 
   const creds = JSON.parse(raw);
 
+  // Required for domain-wide delegation (service account impersonates this user)
+  const subject = process.env.GOOGLE_IMPERSONATE_USER;
+  if (!subject) {
+    throw new Error(
+      "Missing GOOGLE_IMPERSONATE_USER (required for domain-wide delegation). Example: hello@rarepizzas.com"
+    );
+  }
+
   const auth = new google.auth.JWT({
-    email: creds.client_email,
-    key: creds.private_key,
+    clientEmail: creds.client_email,
+    privateKey: creds.private_key,
     scopes: [
       "https://www.googleapis.com/auth/spreadsheets.readonly",
       "https://www.googleapis.com/auth/drive.readonly"
-    ]
+    ],
+    subject
   });
 
   const sheets = google.sheets({ version: "v4", auth });
