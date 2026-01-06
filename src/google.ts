@@ -6,7 +6,6 @@ export function getGoogleClients() {
 
   const creds = JSON.parse(raw);
 
-  // Required for domain-wide delegation (service account impersonates this user)
   const subject = process.env.GOOGLE_IMPERSONATE_USER;
   if (!subject) {
     throw new Error(
@@ -14,21 +13,23 @@ export function getGoogleClients() {
     );
   }
 
-  const auth = new google.auth.JWT({
-    clientEmail: creds.client_email,
-    privateKey: creds.private_key,
-    scopes: [
+  const auth = new google.auth.JWT(
+    creds.client_email,
+    undefined,
+    creds.private_key,
+    [
       "https://www.googleapis.com/auth/spreadsheets.readonly",
       "https://www.googleapis.com/auth/drive.readonly"
     ],
     subject
-  });
+  );
 
   const sheets = google.sheets({ version: "v4", auth });
   const drive = google.drive({ version: "v3", auth });
 
   return { sheets, drive };
 }
+
 
 export function extractSpreadsheetIdsFromText(text: string): string[] {
   const ids = new Set<string>();
