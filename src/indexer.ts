@@ -45,12 +45,18 @@ function sleep(ms: number) {
 
 async function upsertSpreadsheet(id: string) {
   const url = `https://docs.google.com/spreadsheets/d/${id}/edit`;
-  const { error } = await supabase.from("spreadsheets").upsert(
-    { spreadsheet_id: id, url, crawl_status: "pending" },
-    { onConflict: "spreadsheet_id" }
-  );
+
+  // Only insert if new; never overwrite crawl_status for existing rows.
+  const { error } = await supabase
+    .from("spreadsheets")
+    .upsert(
+      { spreadsheet_id: id, url },
+      { onConflict: "spreadsheet_id", ignoreDuplicates: true }
+    );
+
   if (error) throw error;
 }
+
 
 async function getNextPending() {
   const { data, error } = await supabase
@@ -61,8 +67,16 @@ async function getNextPending() {
     .limit(1);
 
   if (error) throw error;
-  return data?.[0]?.spreadsheet_id ?? null;
+
+  const id = data?.[0]?.spreadsheet_id ?? null;
+  if (!id) return null;
+
+  // Claim it so other loops don't keep grabbing the same one
+  await mark(id, { crawl_status: "in_progress", error: null });
+
+  return id;
 }
+
 
 async function mark(id: string, patch: any) {
   const { error } = await supabase
