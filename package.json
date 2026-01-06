@@ -1,0 +1,22 @@
+{
+  "name": "pizzadao-crew-indexer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/indexer.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/indexer.js",
+    "seed": "tsx src/seed.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "googleapis": "^140.0.0",
+    "openai": "^4.56.0",
+    "p-limit": "^6.1.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.3"
+  },
+  "engines": { "node": "18.x" }
+}
