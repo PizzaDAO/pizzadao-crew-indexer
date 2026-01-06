@@ -98,12 +98,13 @@ async function ingestOne(spreadsheetId: string) {
 
     const { data: existing, error: exErr } = await supabase
       .from("spreadsheets")
-      .select("drive_modified_time")
+      .select("drive_modified_time,last_indexed_at")
       .eq("spreadsheet_id", spreadsheetId)
       .maybeSingle();
     if (exErr) throw exErr;
 
     const unchanged =
+      !!existing?.last_indexed_at && // only skip if we've indexed before
       existing?.drive_modified_time &&
       modifiedTime &&
       new Date(modifiedTime).getTime() <= new Date(existing.drive_modified_time).getTime();
