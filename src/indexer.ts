@@ -204,9 +204,15 @@ async function ingestOne(spreadsheetId: string) {
   const t0 = Date.now();
   log("ingest.start", { spreadsheetId });
 
+  // Safety caps to avoid OOM (tune via env if needed)
+  const MAX_GRID_ROWS = Number(process.env.MAX_GRID_ROWS || 600); // per tab
+  const MAX_GRID_COLS = Number(process.env.MAX_GRID_COLS || 80);  // per row (A..CB)
+
   try {
+    // 0) Drive metadata (cheap)
     const { modifiedTime, name } = await driveModifiedTime(spreadsheetId);
 
+    // 1) Check if we've indexed before + unchanged
     const { data: existing, error: exErr } = await supabase
       .from("spreadsheets")
       .select("drive_modified_time,last_indexed_at")
@@ -220,68 +226,102 @@ async function ingestOne(spreadsheetId: string) {
       modifiedTime &&
       new Date(modifiedTime).getTime() <= new Date(existing.drive_modified_time).getTime();
 
-    log("sheets.get.start", { spreadsheetId, includeGridData: true, unchanged });
-    const ss = await sheets.spreadsheets.get(
+    // 2) Fetch spreadsheet metadata ONLY (no grid data) — this is the big memory saver
+    log("sheets.meta.start", { spreadsheetId });
+    const meta = await sheets.spreadsheets.get(
       {
         spreadsheetId,
-        includeGridData: true
+        includeGridData: false,
+        fields: "properties(title),sheets(properties(sheetId,title))"
       },
       { timeout: GOOGLE_TIMEOUT_MS }
     );
-    log("sheets.get.done", {
+    const sheetMetas = meta.data.sheets || [];
+    log("sheets.meta.done", {
       spreadsheetId,
-      sheetCount: ss.data.sheets?.length ?? 0,
-      title: ss.data.properties?.title ?? null
+      sheetCount: sheetMetas.length,
+      title: meta.data.properties?.title ?? null,
+      unchanged
     });
 
     let discoveredLinks = 0;
     let insertedChunks = 0;
 
-    // Discover links + optionally ingest content
-    for (const sh of ss.data.sheets || []) {
-      const sheetName = sh.properties?.title || "Sheet";
-      const gid = sh.properties?.sheetId ?? null;
+    // 3) Process each tab one-by-one (prevents loading entire spreadsheet into memory)
+    for (const shMeta of sheetMetas) {
+      const sheetName = shMeta.properties?.title || "Sheet";
+      const gid = shMeta.properties?.sheetId ?? null;
 
-      // Link discovery from all grid-data blocks
-      for (const gd of sh.data || []) {
-        const ids = extractLinkedSpreadsheetIdsFromGrid(gd);
-        if (ids.length) log("links.found", { spreadsheetId, sheetName, count: ids.length });
+      // Fetch grid data for this single tab, but restrict fields to the minimum we need.
+      // Still potentially big, so we cap how much we *use* below.
+      log("tab.grid.start", { spreadsheetId, sheetName });
+      const oneTab = await sheets.spreadsheets.get(
+        {
+          spreadsheetId,
+          ranges: [`'${sheetName}'`],
+          includeGridData: true,
+          fields:
+            "sheets(properties(sheetId,title),data(rowData(values(formattedValue,userEnteredValue,textFormatRuns(format(link(uri)))))))"
+        },
+        { timeout: GOOGLE_TIMEOUT_MS }
+      );
+      log("tab.grid.done", { spreadsheetId, sheetName });
 
-        for (const id of ids) {
-          discoveredLinks++;
-          await upsertSpreadsheet(id);
+      const tab = oneTab.data.sheets?.[0];
+      const gd = tab?.data?.[0];
+      const rowDataAll = gd?.rowData || [];
 
-          const { error: linkErr } = await supabase.from("links").insert({
-            from_spreadsheet_id: spreadsheetId,
-            from_sheet_name: sheetName,
-            from_a1: null,
-            to_spreadsheet_id: id
+      // ---- Link discovery (bounded) ----
+      // We only scan up to MAX_GRID_ROWS x MAX_GRID_COLS to keep memory bounded.
+      // (If you discover links far below, bump MAX_GRID_ROWS.)
+      const boundedGridForLinks = {
+        rowData: rowDataAll.slice(0, MAX_GRID_ROWS).map((r: any) => ({
+          ...r,
+          values: Array.isArray(r?.values) ? r.values.slice(0, MAX_GRID_COLS) : r?.values
+        }))
+      };
+
+      const ids = extractLinkedSpreadsheetIdsFromGrid(boundedGridForLinks);
+      if (ids.length) log("links.found", { spreadsheetId, sheetName, count: ids.length });
+
+      for (const id of ids) {
+        discoveredLinks++;
+        await upsertSpreadsheet(id);
+
+        const { error: linkErr } = await supabase.from("links").insert({
+          from_spreadsheet_id: spreadsheetId,
+          from_sheet_name: sheetName,
+          from_a1: null,
+          to_spreadsheet_id: id
+        });
+
+        if (linkErr) {
+          // Don't fail the whole ingest on duplicates etc.
+          log("links.insert.warn", {
+            spreadsheetId,
+            toSpreadsheetId: id,
+            message: linkErr.message
           });
-          if (linkErr) {
-            log("links.insert.warn", {
-              spreadsheetId,
-              toSpreadsheetId: id,
-              message: linkErr.message
-            });
-          }
         }
       }
 
+      // If unchanged, we still do link discovery, but we skip chunking/embeddings
       if (unchanged) continue;
 
-      const grid = sh.data?.[0];
-      const rowData = grid?.rowData || [];
+      // ---- Content ingest (bounded) ----
+      const rowData = rowDataAll.slice(0, MAX_GRID_ROWS);
 
-      log("tab.values", { spreadsheetId, sheetName, rows: rowData.length });
+      log("tab.values", { spreadsheetId, sheetName, rows: rowData.length, maxCols: MAX_GRID_COLS });
 
       const values: (string | null)[][] = rowData.map((row: any) => {
         const cells = row?.values || [];
-        return cells.map((cell: any) => cell?.formattedValue ?? null);
+        return cells.slice(0, MAX_GRID_COLS).map((cell: any) => cell?.formattedValue ?? null);
       });
 
       const chunks = chunkRowsAsText({ sheetName, gid, values, maxRowsPerChunk: 25 });
       log("tab.chunks", { spreadsheetId, sheetName, chunkCount: chunks.length });
 
+      // Remove old chunks for this tab
       await supabase.from("chunks").delete().eq("spreadsheet_id", spreadsheetId).eq("sheet_name", sheetName);
 
       for (const ch of chunks) {
@@ -297,14 +337,17 @@ async function ingestOne(spreadsheetId: string) {
         if (error) throw error;
 
         insertedChunks++;
-        if (insertedChunks % 10 === 0) log("chunks.insert.progress", { spreadsheetId, insertedChunks });
+        if (insertedChunks % 10 === 0) {
+          log("chunks.insert.progress", { spreadsheetId, insertedChunks });
+        }
 
         await sleep(SLEEP_MS);
       }
     }
 
+    // 4) Mark spreadsheet state
     await mark(spreadsheetId, {
-      title: name ?? ss.data.properties?.title ?? null,
+      title: name ?? meta.data.properties?.title ?? null,
       drive_modified_time: modifiedTime,
       last_indexed_at: unchanged ? undefined : new Date().toISOString(),
       crawl_status: unchanged ? "skipped" : "indexed",
@@ -329,6 +372,7 @@ async function ingestOne(spreadsheetId: string) {
     }
   }
 }
+
 
 async function main() {
   log("main.start");
