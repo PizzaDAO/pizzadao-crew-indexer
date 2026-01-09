@@ -1,9 +1,21 @@
 // src/indexer.ts
 import { createClient } from "@supabase/supabase-js";
 import pLimit from "p-limit";
+import http from "node:http";
 import { getGoogleClients, extractLinkedSpreadsheetIdsFromGrid } from "./google.js";
 import { chunkRowsAsText } from "./chunk.js";
 import { embed } from "./embed.js";
+
+// ---- Health check server for Railway ----
+const PORT = process.env.PORT || 3000;
+http
+  .createServer((_req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    res.end("ok");
+  })
+  .listen(PORT, () => {
+    console.log(JSON.stringify({ ts: new Date().toISOString(), event: "healthcheck.listening", port: PORT }));
+  });
 
 /**
  * Simple structured logger (Railway-friendly)
