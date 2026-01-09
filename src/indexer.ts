@@ -188,16 +188,85 @@ async function driveModifiedTime(spreadsheetId: string) {
   const res = await drive.files.get(
     {
       fileId: spreadsheetId,
-      fields: "modifiedTime,name"
+      fields: "modifiedTime,name,mimeType"
     },
     { timeout: GOOGLE_TIMEOUT_MS }
   );
   log("drive.get.done", {
     spreadsheetId,
     modifiedTime: res.data.modifiedTime ?? null,
-    name: res.data.name ?? null
+    name: res.data.name ?? null,
+    mimeType: res.data.mimeType ?? null
   });
-  return { modifiedTime: res.data.modifiedTime ?? null, name: res.data.name ?? null };
+  return {
+    modifiedTime: res.data.modifiedTime ?? null,
+    name: res.data.name ?? null,
+    mimeType: res.data.mimeType ?? null
+  };
+}
+
+function safeSheetRange(sheetName: string) {
+  // Sheets API uses single quotes; embedded quotes are doubled
+  const safe = sheetName.replace(/'/g, "''");
+  return `'${safe}'`;
+}
+
+type GridDataLike = {
+  startRow?: number | null;
+  startColumn?: number | null;
+  rowData?: any[];
+};
+
+// Merge multiple GridData blocks into a single bounded values matrix.
+// This is the key fix: don't only index tab.data[0].
+function buildValuesFromGridDataBlocks(opts: {
+  gridDataBlocks: GridDataLike[];
+  maxRows: number;
+  maxCols: number;
+}): (string | null)[][] {
+  const { gridDataBlocks, maxRows, maxCols } = opts;
+
+  // pre-allocate matrix
+  const matrix: (string | null)[][] = Array.from({ length: maxRows }, () =>
+    Array.from({ length: maxCols }, () => null)
+  );
+
+  for (const gd of gridDataBlocks) {
+    const r0 = gd.startRow ?? 0;
+    const c0 = gd.startColumn ?? 0;
+    const rows = gd.rowData || [];
+    for (let i = 0; i < rows.length; i++) {
+      const rr = r0 + i;
+      if (rr < 0 || rr >= maxRows) continue;
+
+      const row = rows[i];
+      const cells = row?.values || [];
+      for (let j = 0; j < cells.length; j++) {
+        const cc = c0 + j;
+        if (cc < 0 || cc >= maxCols) continue;
+
+        const cell = cells[j];
+        const v = cell?.formattedValue ?? null;
+        if (v !== null && v !== undefined && String(v).length > 0) {
+          matrix[rr][cc] = String(v);
+        }
+      }
+    }
+  }
+
+  return matrix;
+}
+
+// Extract sheet IDs from a values matrix as a fallback (if hyperlinks aren't present)
+function extractSheetIdsFromValuesMatrix(values: (string | null)[][]): string[] {
+  const ids = new Set<string>();
+  for (const row of values) {
+    for (const cell of row) {
+      if (!cell) continue;
+      for (const id of extractSheetIdsFromText(cell)) ids.add(id);
+    }
+  }
+  return [...ids];
 }
 
 async function ingestOne(spreadsheetId: string) {
@@ -205,12 +274,28 @@ async function ingestOne(spreadsheetId: string) {
   log("ingest.start", { spreadsheetId });
 
   // Safety caps to avoid OOM (tune via env if needed)
-  const MAX_GRID_ROWS = Number(process.env.MAX_GRID_ROWS || 600); // per tab
-  const MAX_GRID_COLS = Number(process.env.MAX_GRID_COLS || 80);  // per row (A..CB)
+  const MAX_GRID_ROWS = Number(process.env.MAX_GRID_ROWS || 800); // per tab
+  const MAX_GRID_COLS = Number(process.env.MAX_GRID_COLS || 90);  // per row (A..)
+  const MAX_VALUES_FALLBACK_CELLS = Number(process.env.MAX_VALUES_FALLBACK_CELLS || 80_000); // rough cap
+
+  // Unique link enforcement (no caps)
+  const discoveredLinkIds = new Set<string>();
 
   try {
     // 0) Drive metadata (cheap)
-    const { modifiedTime, name } = await driveModifiedTime(spreadsheetId);
+    const { modifiedTime, name, mimeType } = await driveModifiedTime(spreadsheetId);
+
+    // Ensure it's actually a Google Sheet (avoids "This operation is not supported..." spam)
+    if (mimeType && mimeType !== "application/vnd.google-apps.spreadsheet") {
+      await mark(spreadsheetId, {
+        title: name ?? null,
+        drive_modified_time: modifiedTime,
+        crawl_status: "skipped",
+        error: `Not a Google Spreadsheet (mimeType=${mimeType})`
+      });
+      log("ingest.skip.mime", { spreadsheetId, mimeType });
+      return;
+    }
 
     // 1) Check if we've indexed before + unchanged
     const { data: existing, error: exErr } = await supabase
@@ -221,12 +306,12 @@ async function ingestOne(spreadsheetId: string) {
     if (exErr) throw exErr;
 
     const unchanged =
-      !!existing?.last_indexed_at && // only skip if we've indexed before
+      !!existing?.last_indexed_at &&
       existing?.drive_modified_time &&
       modifiedTime &&
       new Date(modifiedTime).getTime() <= new Date(existing.drive_modified_time).getTime();
 
-    // 2) Fetch spreadsheet metadata ONLY (no grid data) — this is the big memory saver
+    // 2) Fetch spreadsheet metadata ONLY (no grid data)
     log("sheets.meta.start", { spreadsheetId });
     const meta = await sheets.spreadsheets.get(
       {
@@ -247,45 +332,61 @@ async function ingestOne(spreadsheetId: string) {
     let discoveredLinks = 0;
     let insertedChunks = 0;
 
-    // 3) Process each tab one-by-one (prevents loading entire spreadsheet into memory)
+    // 3) Process each tab one-by-one
     for (const shMeta of sheetMetas) {
       const sheetName = shMeta.properties?.title || "Sheet";
       const gid = shMeta.properties?.sheetId ?? null;
+      const range = safeSheetRange(sheetName);
 
-      // Fetch grid data for this single tab, but restrict fields to the minimum we need.
-      // Still potentially big, so we cap how much we *use* below.
+      // --- Pull grid data for the tab (hyperlinks + formattedValue) ---
       log("tab.grid.start", { spreadsheetId, sheetName });
+
       const oneTab = await sheets.spreadsheets.get(
         {
           spreadsheetId,
-          ranges: [`'${sheetName}'`],
+          ranges: [range],
           includeGridData: true,
+          // Include startRow/startColumn so we can merge multiple GridData blocks correctly.
           fields:
-            "sheets(properties(sheetId,title),data(rowData(values(formattedValue,userEnteredValue,textFormatRuns(format(link(uri)))))))"
+            "sheets(properties(sheetId,title),data(startRow,startColumn,rowData(values(formattedValue,userEnteredValue,textFormatRuns(format(link(uri)))))))"
         },
         { timeout: GOOGLE_TIMEOUT_MS }
       );
-      log("tab.grid.done", { spreadsheetId, sheetName });
 
       const tab = oneTab.data.sheets?.[0];
-      const gd = tab?.data?.[0];
-      const rowDataAll = gd?.rowData || [];
+      const gridBlocks = (tab?.data || []) as GridDataLike[];
 
-      // ---- Link discovery (bounded) ----
-      // We only scan up to MAX_GRID_ROWS x MAX_GRID_COLS to keep memory bounded.
-      // (If you discover links far below, bump MAX_GRID_ROWS.)
-      const boundedGridForLinks = {
-        rowData: rowDataAll.slice(0, MAX_GRID_ROWS).map((r: any) => ({
-          ...r,
-          values: Array.isArray(r?.values) ? r.values.slice(0, MAX_GRID_COLS) : r?.values
-        }))
-      };
+      log("tab.grid.done", {
+        spreadsheetId,
+        sheetName,
+        gridBlocks: gridBlocks.length,
+        firstBlockRows: gridBlocks?.[0]?.rowData?.length ?? 0
+      });
 
-      const ids = extractLinkedSpreadsheetIdsFromGrid(boundedGridForLinks);
-      if (ids.length) log("links.found", { spreadsheetId, sheetName, count: ids.length });
+      // ---- Link discovery from ALL grid blocks (bounded) ----
+      let linkIdsFromGrid: string[] = [];
+      if (gridBlocks.length > 0) {
+        // Bound each block before handing it to extractLinkedSpreadsheetIdsFromGrid
+        for (const gd of gridBlocks) {
+          const rowDataAll = gd?.rowData || [];
+          const bounded = {
+            ...gd,
+            rowData: rowDataAll.slice(0, MAX_GRID_ROWS).map((r: any) => ({
+              ...r,
+              values: Array.isArray(r?.values) ? r.values.slice(0, MAX_GRID_COLS) : r?.values
+            }))
+          };
+          const ids = extractLinkedSpreadsheetIdsFromGrid(bounded as any);
+          if (ids.length) linkIdsFromGrid.push(...ids);
+        }
+      }
 
-      for (const id of ids) {
+      // De-dupe link ids (per spreadsheet, across tabs)
+      for (const id of linkIdsFromGrid) {
+        if (discoveredLinkIds.has(id)) continue;
+        discoveredLinkIds.add(id);
         discoveredLinks++;
+
         await upsertSpreadsheet(id);
 
         const { error: linkErr } = await supabase.from("links").insert({
@@ -296,7 +397,6 @@ async function ingestOne(spreadsheetId: string) {
         });
 
         if (linkErr) {
-          // Don't fail the whole ingest on duplicates etc.
           log("links.insert.warn", {
             spreadsheetId,
             toSpreadsheetId: id,
@@ -305,17 +405,93 @@ async function ingestOne(spreadsheetId: string) {
         }
       }
 
-      // If unchanged, we still do link discovery, but we skip chunking/embeddings
+      // If unchanged, we still do link discovery, but skip chunking/embeddings
       if (unchanged) continue;
 
-      // ---- Content ingest (bounded) ----
-      const rowData = rowDataAll.slice(0, MAX_GRID_ROWS);
+      // ---- Build values matrix from ALL grid blocks (key fix) ----
+      let values: (string | null)[][] = [];
+      if (gridBlocks.length > 0) {
+        values = buildValuesFromGridDataBlocks({
+          gridDataBlocks: gridBlocks,
+          maxRows: MAX_GRID_ROWS,
+          maxCols: MAX_GRID_COLS
+        });
+      } else {
+        // Fallback: sometimes Sheets API returns 0 grid blocks for a tab.
+        // Use values.get to fetch the used range (formatted), bounded by a rough cell cap.
+        log("tab.values.fallback.start", { spreadsheetId, sheetName });
 
-      log("tab.values", { spreadsheetId, sheetName, rows: rowData.length, maxCols: MAX_GRID_COLS });
+        const vals = await sheets.spreadsheets.values.get(
+          {
+            spreadsheetId,
+            range: range,
+            valueRenderOption: "FORMATTED_VALUE"
+          },
+          { timeout: GOOGLE_TIMEOUT_MS }
+        );
 
-      const values: (string | null)[][] = rowData.map((row: any) => {
-        const cells = row?.values || [];
-        return cells.slice(0, MAX_GRID_COLS).map((cell: any) => cell?.formattedValue ?? null);
+        const raw = (vals.data.values || []) as any[][];
+        // Bound fallback size by cells
+        const boundedRows: (string | null)[][] = [];
+        let cellCount = 0;
+
+        for (let r = 0; r < raw.length && r < MAX_GRID_ROWS; r++) {
+          const row = raw[r] || [];
+          const outRow: (string | null)[] = [];
+          for (let c = 0; c < row.length && c < MAX_GRID_COLS; c++) {
+            outRow.push(row[c] != null ? String(row[c]) : null);
+            cellCount++;
+            if (cellCount >= MAX_VALUES_FALLBACK_CELLS) break;
+          }
+          boundedRows.push(outRow);
+          if (cellCount >= MAX_VALUES_FALLBACK_CELLS) break;
+        }
+
+        values = boundedRows;
+
+        // Also discover sheet IDs from plaintext as a backup (some sheets have bare URLs)
+        const idsFromText = extractSheetIdsFromValuesMatrix(values);
+        for (const id of idsFromText) {
+          if (discoveredLinkIds.has(id)) continue;
+          discoveredLinkIds.add(id);
+          discoveredLinks++;
+
+          await upsertSpreadsheet(id);
+
+          const { error: linkErr } = await supabase.from("links").insert({
+            from_spreadsheet_id: spreadsheetId,
+            from_sheet_name: sheetName,
+            from_a1: null,
+            to_spreadsheet_id: id
+          });
+
+          if (linkErr) {
+            log("links.insert.warn", {
+              spreadsheetId,
+              toSpreadsheetId: id,
+              message: linkErr.message
+            });
+          }
+        }
+
+        log("tab.values.fallback.done", {
+          spreadsheetId,
+          sheetName,
+          rows: values.length,
+          cellCap: MAX_VALUES_FALLBACK_CELLS
+        });
+      }
+
+      // Trim trailing fully-empty rows to reduce chunk spam
+      const isRowEmpty = (row: (string | null)[]) =>
+        !row || row.every((v) => v == null || String(v).trim() === "");
+      while (values.length > 0 && isRowEmpty(values[values.length - 1])) values.pop();
+
+      log("tab.values", {
+        spreadsheetId,
+        sheetName,
+        rows: values.length,
+        maxCols: MAX_GRID_COLS
       });
 
       const chunks = chunkRowsAsText({ sheetName, gid, values, maxRowsPerChunk: 25 });
@@ -372,7 +548,6 @@ async function ingestOne(spreadsheetId: string) {
     }
   }
 }
-
 
 async function main() {
   log("main.start");
