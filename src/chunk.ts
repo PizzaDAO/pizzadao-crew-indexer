@@ -216,14 +216,24 @@ export function chunkRowsAsText({
     }
 
     // We already have headers for this table.
-    // But tabs sometimes have another header deeper down; detect and switch.
-    if (looksLikeHeader(row)) {
-      // Heuristic: if it looks like a header AND we currently have buffered data,
+    // Once we have headers, be VERY conservative about detecting new headers mid-table.
+    // Only treat as new header if the structure is drastically different (e.g., way fewer columns).
+    const currentRowCells = rowToStrings(row, MAX_HEADER_COLS).filter((x) => x !== "");
+    const headerColCount = activeHeaders?.length || 0;
+    const currentColCount = currentRowCells.length;
+
+    // Only consider it a new header if:
+    // 1. It looks like a header AND
+    // 2. It has significantly different column count (suggests a different table structure)
+    const structurallyDifferent = Math.abs(headerColCount - currentColCount) >= 3;
+
+    if (looksLikeHeader(row) && structurallyDifferent) {
+      // Heuristic: if it looks like a header AND structure is very different,
       // start a new table, set new headers, and continue.
       if (bufRows.length > 0) flush();
       // New table within same tab (no blank rows)
       tableIndex++;
-      activeHeaders = rowToStrings(row, MAX_HEADER_COLS).filter((x) => x !== "");
+      activeHeaders = currentRowCells;
       activeHeaderRowIndex = i;
       continue;
     }
