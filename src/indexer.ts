@@ -497,17 +497,33 @@ async function ingestOne(spreadsheetId: string) {
       // Trim trailing fully-empty rows to reduce chunk spam
       const isRowEmpty = (row: (string | null)[]) =>
         !row || row.every((v) => v == null || String(v).trim() === "");
+      const totalRowsBefore = values.length;
       while (values.length > 0 && isRowEmpty(values[values.length - 1])) values.pop();
+
+      // Count non-empty rows for debugging
+      const nonEmptyRowCount = values.filter((r) => !isRowEmpty(r)).length;
 
       log("tab.values", {
         spreadsheetId,
         sheetName,
-        rows: values.length,
+        totalRowsBefore,
+        rowsAfterTrim: values.length,
+        nonEmptyRows: nonEmptyRowCount,
         maxCols: MAX_GRID_COLS
       });
 
       const chunks = chunkRowsAsText({ sheetName, gid, values, maxRowsPerChunk: 25 });
-      log("tab.chunks", { spreadsheetId, sheetName, chunkCount: chunks.length });
+
+      // Log chunk details for debugging
+      log("tab.chunks", {
+        spreadsheetId,
+        sheetName,
+        chunkCount: chunks.length,
+        totalRowsInChunks: chunks.reduce((sum, c) => {
+          const match = c.text.match(/Row \d+:/g);
+          return sum + (match ? match.length : 0);
+        }, 0)
+      });
 
       // Remove old chunks for this tab
       await supabase.from("chunks").delete().eq("spreadsheet_id", spreadsheetId).eq("sheet_name", sheetName);

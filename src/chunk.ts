@@ -65,8 +65,12 @@ export function chunkRowsAsText({
     const nonEmpty = cells.filter((x) => x !== "");
     if (nonEmpty.length < MIN_HEADER_NONEMPTY) return false;
 
-    // If it’s mostly numbers, not a header
+    // If it's mostly numbers, not a header
     if (!isMostlyStrings(cells)) return false;
+
+    // If the first cell is a number, it's likely a data row with an ID column, not a header
+    const firstCell = cells[0];
+    if (firstCell && !isNaN(Number(firstCell))) return false;
 
     // Common header hints: short-ish tokens, no huge paragraphs
     const avgLen =
